@@ -2,7 +2,7 @@
 
 A concise, quick-glance overview of your Rails logs.
 
-![rlog demo](~/Desktop/apps/Obsidian/Personal/CleanShot/rlog.png)
+<img width="300" height="351" alt="rlog" src="https://github.com/user-attachments/assets/0473d57d-0217-48cf-a895-34b8c74eedd2" />
 
 Run it alongside `rails server` in a separate terminal - use rlog for the overview, switch to server output when you need full details.
 
