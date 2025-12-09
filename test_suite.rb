@@ -727,4 +727,199 @@ class RailsAdditionalCoverageTest < Minitest::Test
     assert_match /user_mailer\.rb/, output
     refute_match /app\/mailers\//, output
   end
+
+  # Test multiple log tags (e.g., request_id + IP)
+  def test_multiple_log_tags
+    uuid = "9c47c944-454b-4d70-9fed-667a07359467"
+    log = <<~LOG
+      [#{uuid}] [127.0.0.1] Started GET "/users" for ::1 at 2025-12-01 20:41:10 +0700
+      [#{uuid}] [127.0.0.1] Processing by UsersController#index as HTML
+      [#{uuid}] [127.0.0.1] Parameters: {"page" => "1"}
+      [#{uuid}] [127.0.0.1]    User Load (0.5ms) SELECT * FROM users
+      [#{uuid}] [127.0.0.1] Completed 200 OK in 50ms
+    LOG
+    output = run_parser(log)
+    assert_match /c: UsersController/, output
+    assert_match /a: index/, output
+    assert_match /page:/, output
+    assert_match /User Load/, output
+    assert_match /s: 200/, output
+  end
+
+  # Test multiple log tags with lambda-based tag
+  def test_multiple_log_tags_with_various_formats
+    uuid = "abcd1234-5678-90ab-cdef-1234567890ab"
+    log = <<~LOG
+      [#{uuid}] [192.168.1.100] [custom_tag] Started POST "/orders" for 192.168.1.100
+      [#{uuid}] [192.168.1.100] [custom_tag] Processing by OrdersController#create as JSON
+      [#{uuid}] [192.168.1.100] [custom_tag] Parameters: {"item" => "widget"}
+      [#{uuid}] [192.168.1.100] [custom_tag] Completed 201 Created in 100ms
+    LOG
+    output = run_parser(log)
+    assert_match /c: OrdersController/, output
+    assert_match /a: create/, output
+    assert_match /item:/, output
+    assert_match /s: 201/, output
+    # First extra tag (IP) should be shown before the path
+    assert_match /\[192\.168\.1\.100\].*POST/, output
+  end
+
+  # Test with 3 extra tags
+  def test_three_extra_log_tags
+    uuid = "aaaa1111-2222-3333-4444-555566667777"
+    log = <<~LOG
+      [#{uuid}] [10.0.0.1] [user:123] [session:abc] Started GET "/dashboard"
+      [#{uuid}] [10.0.0.1] [user:123] [session:abc] Processing by DashboardController#show as HTML
+      [#{uuid}] [10.0.0.1] [user:123] [session:abc] Completed 200 OK in 50ms
+    LOG
+    output = run_parser(log)
+    assert_match /c: DashboardController/, output
+    assert_match /a: show/, output
+    assert_match /s: 200/, output
+    # First extra tag should be shown
+    assert_match /\[10\.0\.0\.1\].*GET/, output
+  end
+
+  # Test with IPv6 address tag
+  def test_ipv6_log_tag
+    uuid = "bbbb2222-3333-4444-5555-666677778888"
+    log = <<~LOG
+      [#{uuid}] [::1] Started GET "/api/status"
+      [#{uuid}] [::1] Processing by ApiController#status as JSON
+      [#{uuid}] [::1] Completed 200 OK in 5ms
+    LOG
+    output = run_parser(log)
+    assert_match /c: ApiController/, output
+    assert_match /a: status/, output
+    assert_match /\[::1\].*GET/, output
+  end
+
+  # Test mixed: some requests with tags, some without
+  def test_mixed_requests_with_and_without_tags
+    uuid1 = "cccc3333-4444-5555-6666-777788889999"
+    uuid2 = "dddd4444-5555-6666-7777-888899990000"
+    log = <<~LOG
+      [#{uuid1}] [192.168.1.50] Started GET "/with-ip"
+      [#{uuid1}] [192.168.1.50] Processing by WithIpController#index as HTML
+      [#{uuid1}] [192.168.1.50] Completed 200 OK in 10ms
+
+      [#{uuid2}] Started GET "/no-ip"
+      [#{uuid2}] Processing by NoIpController#index as HTML
+      [#{uuid2}] Completed 200 OK in 10ms
+    LOG
+    output = run_parser(log)
+    # Request with IP tag
+    assert_match /\[192\.168\.1\.50\].*GET.*\/with-ip/, output
+    assert_match /c: WithIpController/, output
+    # Request without IP tag (no brackets before GET)
+    assert_match /^GET \/no-ip$/m, output
+    assert_match /c: NoIpController/, output
+  end
+
+  # Test custom log tags (Rails.logger.tagged) are preserved in log output
+  def test_custom_log_tags_preserved
+    uuid = "eeee5555-6666-7777-8888-999900001111"
+    log = <<~LOG
+      [#{uuid}] [::1] Started GET "/gatherings"
+      [#{uuid}] [::1] Processing by GatheringsController#index as HTML
+      [#{uuid}] [::1] [GatheringsIndex] ==> Loading gatherings for account 2
+      [#{uuid}] [::1] Completed 200 OK in 100ms
+    LOG
+    output = run_parser(log)
+    # System tag (IP) should appear in header
+    assert_match /\[::1\].*GET/, output
+    # Custom tag should appear with the log line
+    assert_match /\[GatheringsIndex\].*==> Loading gatherings/, output
+    # Log content should be present
+    assert_match /account 2/, output
+  end
+
+  # Test system tags (appearing on most lines) are stripped from log output
+  def test_system_tags_stripped_from_logs
+    uuid = "ffff6666-7777-8888-9999-000011112222"
+    log = <<~LOG
+      [#{uuid}] [::1] Started GET "/users"
+      [#{uuid}] [::1] Processing by UsersController#index as HTML
+      [#{uuid}] [::1] ==> Debug message without custom tag
+      [#{uuid}] [::1] Completed 200 OK in 50ms
+    LOG
+    output = run_parser(log)
+    # System tag should appear in header
+    assert_match /\[::1\].*GET/, output
+    # Log line should NOT have ::1 tag (it's a system tag)
+    assert_match /log:/, output
+    assert_match %r{==>.*Debug message}, output
+    # The ::1 should not appear next to the log message
+    refute_match %r{\[::1\].*==>.*Debug}, output
+  end
+
+  # Test multiple custom tags on a single log line
+  def test_multiple_custom_tags_on_log_line
+    uuid = "11112222-3333-4444-5555-666677778888"
+    log = <<~LOG
+      [#{uuid}] [::1] Started GET "/orders"
+      [#{uuid}] [::1] Processing by OrdersController#index as HTML
+      [#{uuid}] [::1] [OrdersScope] [AdminOnly] ==> Filtering admin orders
+      [#{uuid}] [::1] Completed 200 OK in 75ms
+    LOG
+    output = run_parser(log)
+    # Both custom tags should appear
+    assert_match /\[OrdersScope\]/, output
+    assert_match /\[AdminOnly\]/, output
+    assert_match %r{==>.*Filtering admin orders}, output
+  end
+
+  # Test log lines without any custom tags
+  def test_log_line_without_custom_tags
+    uuid = "22223333-4444-5555-6666-777788889999"
+    log = <<~LOG
+      [#{uuid}] [::1] Started GET "/posts"
+      [#{uuid}] [::1] Processing by PostsController#index as HTML
+      [#{uuid}] [::1] ==> Simple log message
+      [#{uuid}] [::1] Completed 200 OK in 25ms
+    LOG
+    output = run_parser(log)
+    # Log should appear without any tag prefix (since ::1 is system tag)
+    assert_match /log:/, output
+    assert_match %r{==>.*Simple log message}, output
+  end
+
+  # Test custom tags don't affect other log types (SQL, HTML, etc.)
+  def test_custom_tags_only_affect_log_lines
+    uuid = "33334444-5555-6666-7777-888899990000"
+    log = <<~LOG
+      [#{uuid}] [::1] Started GET "/items"
+      [#{uuid}] [::1] Processing by ItemsController#index as HTML
+      [#{uuid}] [::1] [CustomTag] ==> Custom tagged log
+      [#{uuid}] [::1]    Item Load (0.5ms) SELECT * FROM items
+      [#{uuid}] [::1]    Rendered items/index.html.erb (Duration: 5ms)
+      [#{uuid}] [::1] Completed 200 OK in 50ms
+    LOG
+    output = run_parser(log)
+    # Custom tag should only appear with log line
+    assert_match /\[CustomTag\].*==> Custom tagged log/, output
+    # SQL and HTML should not have the custom tag
+    assert_match /Item Load/, output
+    refute_match /\[CustomTag\].*Item Load/, output
+    assert_match /items\/index\.html\.erb/, output
+  end
+
+  # Test tag frequency detection (system vs custom)
+  def test_tag_frequency_detection
+    uuid = "44445555-6666-7777-8888-999900001111"
+    # IP tag appears on all 5 lines (100%), custom tag only on 1 line (20%)
+    log = <<~LOG
+      [#{uuid}] [10.0.0.1] Started GET "/dashboard"
+      [#{uuid}] [10.0.0.1] Processing by DashboardController#show as HTML
+      [#{uuid}] [10.0.0.1]    Dashboard Load (1.0ms) SELECT * FROM dashboards
+      [#{uuid}] [10.0.0.1] [MetricsLog] ==> Calculating metrics
+      [#{uuid}] [10.0.0.1] Completed 200 OK in 100ms
+    LOG
+    output = run_parser(log)
+    # IP (system tag, >50% frequency) should be in header
+    assert_match /\[10\.0\.0\.1\].*GET/, output
+    # MetricsLog (custom tag, <50% frequency) should be with log line
+    assert_match /\[MetricsLog\].*==> Calculating metrics/, output
+  end
+
 end

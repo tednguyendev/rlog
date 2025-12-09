@@ -24,7 +24,7 @@ module RailsLog                                                                 
     SQL   = / (Load|Update|Update All|Create|Destroy|Exists\?|Count) \(|SQL \(|TRANSACTION|BEGIN|COMMIT|ROLLBACK/  # Regex to match SQL queries
 
     # Patterns for parsing log structure (rarely need to change)
-    REQUEST_LINE = /^\[([a-f0-9\-]+)\]\s+(.*)/                                   # Regex to extract UUID and content from log lines
+    REQUEST_LINE = /^\[([a-f0-9\-]+)\]\s+((?:\[[^\]]*\]\s+)*)(.*)/               # Regex to extract UUID, extra tags, and content from log lines
     STARTED      = /^Started (\w+) "([^"]+)"/                                    # Regex to match request start (method + path)
     PROCESSING   = /Processing by ([^#]+)#(\w+)/                                 # Regex to match controller#action
     PARAMETERS   = /Parameters: (\{.*\})/                                        # Regex to match request parameters
@@ -170,7 +170,9 @@ module RailsLog                                                                 
       @req_buffer = Hash.new do |h, k|                                           # Hash with default block for new request data
         h[k] = {                                                                 # Create new request hash with empty arrays
           'rb' => [], 'html' => [], 'sql' => [], 'log' => [], 'error' => [],     # Arrays for each data type
-          'source_found' => false                                                # Flag for error source tracking
+          'source_found' => false,                                               # Flag for error source tracking
+          'line_count' => 0,                                                     # Total lines seen for this request
+          'tag_counts' => Hash.new(0)                                            # Count occurrences of each tag
         }
       end
       @slow_threshold = (ENV['S_SLOW_MS'] || 500).to_i                           # Get slow threshold from env or default
@@ -261,10 +263,17 @@ module RailsLog                                                                 
       # Buffer Rotation
       @req_buffer.shift if @req_buffer.size > 50                                 # Remove oldest request if buffer full
 
-      return unless raw =~ Config::REQUEST_LINE                                  # Skip lines without UUID prefix
-      uuid, content = Regexp.last_match(1), clean_line(Regexp.last_match(2))     # Extract UUID and content
+      return unless (match = raw.match(Config::REQUEST_LINE))                    # Skip lines without UUID prefix
+      uuid = match[1]                                                            # Extract UUID
+      extra_tags_str = match[2] || ''                                            # Extra tags string (may be empty)
+      raw_content = match[3] || ''                                               # Raw content after tags
+      extra_tags = extra_tags_str.scan(/\[([^\]]*)\]/).flatten                   # Extract extra tags (e.g., IP address)
 
       request = @req_buffer[uuid]                                                # Get or create request data
+      request['line_count'] += 1                                                 # Increment line count
+      extra_tags.each { |t| request['tag_counts'][t] += 1 }                      # Track tag occurrences
+
+      content = clean_line(raw_content)                                          # Clean the content (tags handled at print time)
 
       # If we see a "Started" line, but the previous request with this UUID
       # was already flushed (likely an error stack trace kept it alive), clean it up.
@@ -280,16 +289,15 @@ module RailsLog                                                                 
       end
 
       # Parsing State Machine
-      case content                                                               # Match content type
-      when Config::STARTED                                                       # Request start line
-        request.merge!(m: Regexp.last_match(1), p: Regexp.last_match(2))  # Store method and path
-      when Config::PROCESSING                                                    # Controller processing line
-        request.merge!(c: Regexp.last_match(1), a: Regexp.last_match(2))         # Store controller and action
-      when Config::PARAMETERS                                                    # Parameters line
-        request[:pm] = Regexp.last_match(1)                                      # Store parameters hash
-      when Config::COMPLETED                                                     # Request completed line
-        status = Regexp.last_match(1).to_i                                       # Extract HTTP status code
-        duration = Regexp.last_match(2)                                          # Extract duration in ms
+      if (m = content.match(Config::STARTED))                                    # Request start line
+        request.merge!(m: m[1], p: m[2])                                         # Store method and path
+      elsif (m = content.match(Config::PROCESSING))                              # Controller processing line
+        request.merge!(c: m[1], a: m[2])                                         # Store controller and action
+      elsif (m = content.match(Config::PARAMETERS))                              # Parameters line
+        request[:pm] = m[1]                                                      # Store parameters hash
+      elsif (m = content.match(Config::COMPLETED))                               # Request completed line
+        status = m[1].to_i                                                       # Extract HTTP status code
+        duration = m[2]                                                          # Extract duration in ms
 
         flush_request(request, status, duration)                                 # Print the request output
 
@@ -301,11 +309,11 @@ module RailsLog                                                                 
           @req_buffer.delete(uuid)                                               # Remove completed request from buffer
         end
       else
-        accumulate_data(request, content)                                        # Accumulate other data (SQL, logs, etc.)
+        accumulate_data(request, content, extra_tags)                            # Accumulate other data (SQL, logs, etc.)
       end
     end
 
-    def accumulate_data(request, content)                                        # Accumulate data into request buffer
+    def accumulate_data(request, content, extra_tags)                            # Accumulate data into request buffer
       if content =~ Config::RB                                                   # Ruby file reference
         val = content[/((?:app|lib)\/[\w\/\.]+\.rb:\d+)/, 1]                     # Extract file path with line number
         request['rb'] << val if val                                              # Add to rb array
@@ -316,7 +324,7 @@ module RailsLog                                                                 
       elsif content =~ Config::SQL                                               # SQL query
         request['sql'] << content                                                # Add to sql array
       elsif content =~ Config::LOG                                               # Debug log
-        request['log'] << content                                                # Add to log array
+        request['log'] << { content: content, tags: extra_tags }                 # Add content + tags to log array
       end
     end
 
@@ -369,7 +377,17 @@ module RailsLog                                                                 
     end
 
     def print_header(req, _status, _color)                                       # Print request header
-      puts "#{C.white(req[:m])} #{req[:p]}" if ENV['S_PATH']                     # Print method and path if path flag set
+      if ENV['S_PATH']                                                           # Print method and path if path flag set
+        # Get system tags (appear on >50% of lines) for header display
+        line_count = req['line_count']
+        tag_counts = req['tag_counts']
+        system_tags = tag_counts.select { |_, count| count > line_count * 0.5 }.keys  # Tags on >50% of lines
+
+        line = ""
+        line += "#{C.dim("[#{system_tags.join('] [')}]")} " if system_tags.any? # Prepend system tags (e.g., IP) if present
+        line += "#{C.white(req[:m])} #{req[:p]}"                                 # Add method + path
+        puts line
+      end
       puts "  #{C.cyan(Config::LABELS['controller'])} #{C.cyan(req[:c])}" if ENV['S_CONTROLLER'] && req[:c]  # Print controller if flag set
       puts "  #{C.cyan(Config::LABELS['action'])} #{C.cyan(req[:a])}" if ENV['S_ACTION'] && req[:a]  # Print action if flag set
     end
@@ -524,10 +542,21 @@ module RailsLog                                                                 
 
     def print_logs(req)                                                          # Print debug log entries
       return unless ENV['S_LOG'] && req['log'].any?                              # Return if no logs or flag not set
+
+      # Determine which tags are "system" (appear on most lines) vs "custom" (appear rarely)
+      line_count = req['line_count']
+      tag_counts = req['tag_counts']
+      system_tags = tag_counts.select { |_, count| count > line_count * 0.5 }.keys  # Tags on >50% of lines are system tags
+
       puts "  #{C.green(Config::LABELS['log'])}"                                 # Print log section label
-      req['log'].each do |x|                                                     # Process each log entry
-        c = x.gsub(/^\s*↳\s*/, '').strip                                         # Clean up the log line
-        puts "  #{C.green(c)}" unless hidden?('log', c)                          # Print in green unless hidden
+      req['log'].each do |entry|                                                 # Process each log entry
+        content = entry[:content].gsub(/^\s*↳\s*/, '').strip                     # Clean up the log line
+        custom_tags = entry[:tags] - system_tags                                 # Filter out system tags, keep custom tags
+
+        next if hidden?('log', content)                                          # Skip if hidden
+
+        tag_prefix = custom_tags.any? ? "#{C.cyan("[#{custom_tags.join('] [')}]")} " : ""  # Format custom tags
+        puts "    #{tag_prefix}#{C.green(content)}"                              # Print with proper indentation
       end
     end
 
